@@ -3,6 +3,10 @@ package updater
 import (
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/go-logr/logr"
@@ -10,28 +14,48 @@ import (
 	"gopkg.in/ini.v1"
 )
 
+const (
+	userFilePrefix   = "user_"
+	adminFileSection = "default"
+)
+
+// UserCredentials holds the plain‐text credentials read from a secret file group.
+type UserCredentials struct {
+	Username string
+	Password string
+	Tag      string
+}
+
+// PasswordUpdater now uses a WatchDir instead of single default configuration file.
+// CredentialCache stores the last successfully verified user credentials.
 type PasswordUpdater struct {
-	DefaultUserFile string
 	AdminFile       string
 	Watcher         *fsnotify.Watcher
 	WatchDir        string
 	Done            chan<- bool
 	Log             logr.Logger
-	Rmqc            RabbitClient
+	adminClient     RabbitClient
+	authClient      RabbitClient
+	CredentialCache map[string]UserCredentials
 }
 
 type RabbitClient interface {
 	// RabbitMQ Management API functions
-	GetUser(string) (*rabbithole.UserInfo, error)
-	PutUser(string, rabbithole.UserSettings) (*http.Response, error)
+	GetUser(username string) (*rabbithole.UserInfo, error)
+	PutUser(username string, settings rabbithole.UserSettings) (*http.Response, error)
 	Whoami() (*rabbithole.WhoamiInfo, error)
-	// Field getters and setters
+
+	// Credential management functions
 	GetUsername() string
-	SetUsername(string)
-	SetPassword(string)
+	SetUsername(username string)
+	SetPassword(password string)
 }
 
+// HandleEvents continuously waits for file system events and processes secrets when any file
+// matching the expected pattern is changed.
 func (u *PasswordUpdater) HandleEvents() {
+	defer u.Watcher.Close()
+
 	for {
 		select {
 		case event, ok := <-u.Watcher.Events:
@@ -40,61 +64,14 @@ func (u *PasswordUpdater) HandleEvents() {
 				u.Done <- true
 				return
 			}
-			if fileChanged(u.DefaultUserFile, event) {
-				u.Log.V(2).Info("file system event", "file", u.DefaultUserFile, "operation", event.Op.String())
-
-				// read default user username and (new) password
-				defaultUserCfg, err := ini.Load(u.DefaultUserFile)
-				if err != nil {
-					u.Log.Error(err, "failed to load INI data source", "file", u.DefaultUserFile)
+			u.Log.V(4).Info("file system event", "file", event.Name, "operation", event.Op.String())
+			if isSecretFile(event.Name) {
+				if err := u.processSecrets(); err != nil {
+					u.Log.Error(err, "failed to process secrets")
 					u.Done <- true
 					return
 				}
-				defaultUser := defaultUserCfg.Section("").Key("default_user").String()
-				newPasswd := defaultUserCfg.Section("").Key("default_pass").String()
-
-				// read admin username and (old) password
-				adminCfg, err := ini.Load(u.AdminFile)
-				if err != nil {
-					u.Log.Error(err, "failed to load INI data source", "file", u.AdminFile)
-					u.Done <- true
-					return
-				}
-				adminSection := adminCfg.Section("default")
-				adminUser := adminSection.Key("username").String()
-				oldPasswd := adminSection.Key("password").String()
-
-				if defaultUser != adminUser {
-					u.Log.V(0).Info("exiting because usernames do not match",
-						"default-user", defaultUser, "default-user-file", u.DefaultUserFile,
-						"admin-user", adminUser, "admin-file", u.AdminFile)
-					u.Done <- true
-					return
-				}
-				if newPasswd == oldPasswd {
-					u.Log.V(2).Info("passwords already match, nothing to do", "username", defaultUser)
-					break
-				}
-
-				u.Rmqc.SetUsername(adminUser)
-				u.Rmqc.SetPassword(oldPasswd)
-
-				if err := u.updateInRabbitMQ(adminUser, newPasswd); err != nil {
-					break
-				}
-
-				u.Log.V(4).Info("copying new password...", "source", u.DefaultUserFile, "target", u.AdminFile)
-				adminSection.Key("password").SetValue(newPasswd)
-				if err := adminCfg.SaveTo(u.AdminFile); err != nil {
-					u.Log.Error(err, "failed to write new password", "file", u.AdminFile)
-					u.Done <- true
-					return
-				}
-				u.Log.V(2).Info("copied new password", "source", u.DefaultUserFile, "target", u.AdminFile)
-			} else {
-				u.Log.V(4).Info("file system event", "file", event.Name, "operation", event.Op.String())
 			}
-
 		case err, ok := <-u.Watcher.Errors:
 			if !ok {
 				u.Log.V(0).Info("watcher errors channel is closed, exiting...")
@@ -104,39 +81,171 @@ func (u *PasswordUpdater) HandleEvents() {
 			u.Log.Error(err, "failed to watch", "directory", u.WatchDir)
 		}
 	}
-
 }
 
-func fileChanged(defaultUserFile string, event fsnotify.Event) bool {
-	return event.Name == defaultUserFile &&
-		(event.Op&fsnotify.Create == fsnotify.Create ||
-			event.Op&fsnotify.Write == fsnotify.Write)
+// isSecretFile returns true if the base name starts with "user_".
+func isSecretFile(filePath string) bool {
+	base := filepath.Base(filePath)
+	return strings.HasPrefix(base, userFilePrefix)
 }
 
-// updateInRabbitMQ sets newPasswd for existingUser in the RabbitMQ server.
-// It returns an error if password cannot be updated.
-func (u *PasswordUpdater) updateInRabbitMQ(existingUser, newPasswd string) error {
-	pathUsers := "/api/users/" + existingUser
+// processSecrets reads all files in WatchDir, groups them by user ID (based on file names),
+// and then (using admin credentials) updates every user whose password has changed.
+func (u *PasswordUpdater) processSecrets() error {
+	u.adminClient.SetUsername(u.CredentialCache["admin"].Username)
+	u.adminClient.SetPassword(u.CredentialCache["admin"].Password)
 
-	user, err := u.Rmqc.GetUser(existingUser)
+	files, err := os.ReadDir(u.WatchDir)
 	if err != nil {
-		return u.handleHTTPError(err, http.MethodGet, pathUsers, newPasswd)
+		return err
 	}
 
-	// We succeeded to fetch user tags, continue to update user password.
+	secretFiles := make(map[string][]byte)
+	for _, file := range files {
+		if file.IsDir() || !strings.HasPrefix(file.Name(), userFilePrefix) {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(u.WatchDir, file.Name()))
+		if err != nil {
+			u.Log.Error(err, "failed to read secret file", "file", file.Name())
+			return err
+		}
+		secretFiles[file.Name()] = content
+	}
+
+	secrets := make(map[string]map[string]string)
+	for name, contentBytes := range secretFiles {
+		remainder := name[len(userFilePrefix):]
+		parts := strings.SplitN(remainder, "_", 2)
+		if len(parts) != 2 {
+			u.Log.V(2).Info("ignoring file with unexpected name format", "file", name)
+			continue
+		}
+		userName, key := parts[0], parts[1]
+		value := strings.TrimSpace(string(contentBytes))
+		if _, exists := secrets[userName]; !exists {
+			secrets[userName] = make(map[string]string)
+		}
+		secrets[userName][key] = value
+	}
+
+	var userNames []string
+	for userID := range secrets {
+		userNames = append(userNames, userID)
+	}
+	sort.Strings(userNames)
+
+	for _, userID := range userNames {
+		data := secrets[userID]
+		username, hasUsername := data["username"]
+		password, hasPassword := data["password"]
+		tag, hasTag := data["tag"]
+
+		if cached, exists := u.CredentialCache[username]; exists &&
+			cached.Password == password && cached.Tag == tag {
+			u.Log.V(4).Info("credentials unchanged, skipping update", "user", username)
+			continue
+		}
+
+		u.authClient.SetUsername(username)
+		u.authClient.SetPassword(password)
+
+		if !hasUsername || !hasPassword {
+			u.Log.V(2).Info("skipping user with incomplete credentials", "userID", userID)
+			continue
+		}
+		if !hasTag {
+			tag = ""
+		}
+
+		if userID == "admin" {
+			if strings.TrimSpace(username) == "" || strings.TrimSpace(password) == "" {
+				return fmt.Errorf("incomplete or empty admin credentials")
+			}
+			currentAdminUser := u.adminClient.GetUsername()
+			if currentAdminUser != username {
+				// If admin username has changed, verify we can still authenticate
+				// with current credentials before proceeding with the update
+				u.Log.V(2).Info("admin username changed", "old", currentAdminUser, "new", username)
+				if err := u.authenticate(); err != nil {
+					return fmt.Errorf("failed to authenticate with current admin credentials: %w", err)
+				}
+			}
+		}
+
+		newCred := UserCredentials{
+			Username: username,
+			Password: password,
+			Tag:      tag,
+		}
+
+		// Update credentials in RabbitMQ
+		if err := u.updateInRabbitMQ(newCred); err != nil {
+			return fmt.Errorf("failed to update credentials in RabbitMQ for user %s: %w", username, err)
+		}
+		// Update credentials cache, so that we can skip the next update if the credentials haven't changed
+		u.CredentialCache[username] = newCred
+
+		if userID == "admin" {
+			// Update admin credentials file, eg /var/lib/rabbitmq/.rabbitmqadmin.conf
+			// Check whether the current admin file are up-to-date.
+			correct, err := u.checkAdminFile(newCred)
+			if err != nil {
+				u.Log.Error(err, "failed to load admin credentials file", "file", u.AdminFile)
+			}
+			if !correct {
+				if err := u.updateAdminFile(newCred); err != nil {
+					u.Log.Error(err, "failed to update RabbitMQ admin credentials file", "user", username)
+				} else {
+					u.Log.V(2).Info("updated admin credentials file", "file", u.AdminFile)
+				}
+			} else {
+				u.Log.V(2).Info("admin credentials file is already up-to-date, no update needed", "file", u.AdminFile)
+			}
+			if err := u.authenticate(); err != nil {
+				u.Log.Error(err, "extra admin step: failed to re-authenticate after updating admin credentials", "user", username)
+			} else {
+				u.Log.V(2).Info("extra admin step: re-authentication successful for admin", "user", username)
+			}
+		}
+	}
+	return nil
+}
+
+// updateInRabbitMQ tries to update a user's password (and tag) on the RabbitMQ server.
+func (u *PasswordUpdater) updateInRabbitMQ(cred UserCredentials) error {
+	pathUsers := "/api/users/" + cred.Username
+
+	var user *rabbithole.UserInfo
+	var err error
+	user, err = u.adminClient.GetUser(cred.Username)
+	if err != nil {
+		return u.handleHTTPError(err, http.MethodGet, pathUsers, cred.Password)
+	}
+	if user == nil {
+		return fmt.Errorf("no user info returned for user %s", cred.Username)
+	}
+
+	// Check if the new password is already effective.
+	// (For both types of user we call the proper Whoami check.)
+	if err := u.authenticate(); err == nil {
+		u.Log.V(2).Info("GET request succeeded with new password; skipping PUT",
+			"path", "/api/whoami", "skip_path", pathUsers)
+		return nil
+	}
+
 	newUserSettings := rabbithole.UserSettings{
-		Name:             existingUser,
-		Tags:             user.Tags,
-		Password:         newPasswd,
+		Name:             cred.Username,
+		Tags:             rabbithole.UserTags{cred.Tag},
+		Password:         cred.Password,
 		HashingAlgorithm: user.HashingAlgorithm,
 	}
-	resp, err := u.Rmqc.PutUser(existingUser, newUserSettings)
+	resp, err := u.adminClient.PutUser(cred.Username, newUserSettings)
 	if err != nil {
-		return u.handleHTTPError(err, http.MethodPut, pathUsers, newPasswd)
+		return u.handleHTTPError(err, http.MethodPut, pathUsers, cred.Password)
 	}
-
 	u.Log.V(3).Info("HTTP response", "method", http.MethodPut, "path", pathUsers, "status", resp.Status)
-	u.Log.V(2).Info("updated password on RabbitMQ server", "user", existingUser)
+	u.Log.V(2).Info("updated password on RabbitMQ server", "user", cred.Username)
 	return nil
 }
 
@@ -146,10 +255,9 @@ func (u *PasswordUpdater) handleHTTPError(err error, httpMethod, pathUsers, newP
 	if err.Error() == "Error: API responded with a 401 Unauthorized" {
 		// Only one node in a multi node RabbitMQ cluster will update the password.
 		// All other nodes are expected to run into this branch.
-		u.Log.V(2).Info(
-			"HTTP request with old password returned 401 Unauthorized, therefore trying to authenticate with new password...",
+		u.Log.V(2).Info("HTTP request with old password returned 401 Unauthorized; authenticating with new password...",
 			"method", httpMethod, "path", pathUsers)
-		u.Rmqc.SetPassword(newPasswd)
+		u.adminClient.SetPassword(newPasswd)
 		return u.authenticate()
 	}
 	u.Log.Error(err, "HTTP request failed", "method", httpMethod, "path", pathUsers)
@@ -161,12 +269,44 @@ func (u *PasswordUpdater) handleHTTPError(err error, httpMethod, pathUsers, newP
 // Returns an error if authentication fails.
 func (u *PasswordUpdater) authenticate() error {
 	const pathWhoAmI = "/api/whoami"
-	_, err := u.Rmqc.Whoami()
+	_, err := u.authClient.Whoami()
 	if err != nil {
 		u.Log.Error(err, fmt.Sprintf("failed to GET %s with new password", pathWhoAmI))
 		return err
 	}
-	u.Log.V(2).Info(fmt.Sprintf(
-		"GET %s with new password succeeded, therefore skipping PUT %s...", pathWhoAmI, "/api/users/"+u.Rmqc.GetUsername()))
+	u.Log.V(2).Info("GET request succeeded, skipping PUT",
+		"path", pathWhoAmI,
+		"skip_path", "/api/users/"+u.authClient.GetUsername())
 	return nil
+}
+
+// updateAdminFile writes the admin credentials into the rabbitmqadmin file using gopkg.in/ini.v1.
+// If the file does not exist, it creates a new one.
+func (u *PasswordUpdater) updateAdminFile(cred UserCredentials) error {
+	cfg, err := ini.LooseLoad(u.AdminFile)
+	if err != nil {
+		return fmt.Errorf("failed to load admin ini file: %w", err)
+	}
+	// Update the default section with the new admin username and password.
+	cfg.Section(adminFileSection).Key("username").SetValue(cred.Username)
+	cfg.Section(adminFileSection).Key("password").SetValue(cred.Password)
+	if err := cfg.SaveTo(u.AdminFile); err != nil {
+		return fmt.Errorf("failed to save admin ini file: %w", err)
+	}
+	return nil
+}
+
+// checkAdminFile checks whether the admin credentials file contains the expected username and password.
+// Returns true if the file is correct, or false if it is missing or has incorrect credentials.
+func (u *PasswordUpdater) checkAdminFile(cred UserCredentials) (bool, error) {
+	cfg, err := ini.LooseLoad(u.AdminFile)
+	if err != nil {
+		return false, err
+	}
+	section := cfg.Section(adminFileSection)
+	if strings.TrimSpace(section.Key("username").String()) != cred.Username ||
+		strings.TrimSpace(section.Key("password").String()) != cred.Password {
+		return false, nil
+	}
+	return true, nil
 }

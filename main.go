@@ -4,11 +4,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -23,21 +21,19 @@ import (
 )
 
 func main() {
-	var managementURI, caFile string
-	u := &updater.PasswordUpdater{}
+	var managementURI, caFile, adminFile, watchDir string
 
 	flag.StringVar(
-		&u.DefaultUserFile,
-		"default-user-file",
-		"/etc/rabbitmq/conf.d/11-default_user.conf",
-		"Absolute path to file containing default user username and (updated) password. "+
-			"Its directory will be watched for changes.")
-	flag.StringVar(
-		&u.AdminFile,
+		&adminFile,
 		"admin-file",
 		"/var/lib/rabbitmq/.rabbitmqadmin.conf",
 		"Absolute path to file used by rabbitmqadmin CLI. "+
 			"It contains RabbitMQ admin username (must be the same as default user username) and (old) password.")
+	flag.StringVar(
+		&watchDir,
+		"watch-dir",
+		"/etc/rabbitmq/secrets",
+		"Directory containing user secrets files in the format user_<id>_{username,password,tag}.")
 	flag.StringVar(
 		&managementURI,
 		"management-uri",
@@ -50,20 +46,14 @@ func main() {
 		"This file contains the trusted certificate for RabbitMQ server authentication.")
 	klog.InitFlags(nil)
 	flag.Parse()
+
 	log := klogr.New().WithName("password-updater")
-	u.Log = log
 
 	rabbitClient, err := newRabbitClient(log, managementURI, caFile)
 	if err != nil {
 		log.Error(err, "failed to create RabbitMQ client")
 		return
 	}
-	u.Rmqc = rabbitClient
-
-	// Watch the directory because the file gets re-created (i.e. first removed and then created)
-	// when password is updated by Vault agent and fsnotify will stop watching a re-created file.
-	watchDir := filepath.Dir(u.DefaultUserFile)
-	u.WatchDir = watchDir
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -71,7 +61,6 @@ func main() {
 		return
 	}
 	defer watcher.Close()
-	u.Watcher = watcher
 
 	// Remove trailing new line (.rabbitmqadmin.conf has only one section).
 	ini.PrettySection = false
@@ -83,9 +72,14 @@ func main() {
 	// This channel will contain a value when our program terminates itself.
 	// This is preferred over calling os.Exit() because os.Exit() does not run deferred functions.
 	done := make(chan bool, 1)
-	u.Done = done
 
-	go u.HandleEvents()
+	passwordUpdater, err := updater.NewPasswordUpdater(adminFile, watchDir, done, log, rabbitClient, rabbitClient)
+	if err != nil {
+		log.Error(err, "Failed to initialize PasswordUpdater")
+		return
+	}
+
+	go passwordUpdater.HandleEvents()
 
 	log.V(1).Info("start watching", "directory", watchDir)
 	if err := watcher.Add(watchDir); err != nil {
@@ -103,7 +97,7 @@ func main() {
 
 func newRabbitClient(log logr.Logger, managementURI, caFile string) (updater.RabbitClient, error) {
 	if strings.HasPrefix(managementURI, "https") {
-		caCert, err := ioutil.ReadFile(caFile)
+		caCert, err := os.ReadFile(caFile)
 		if err != nil {
 			log.Error(err, "failed to read CA file", "file", caFile)
 			return nil, err
