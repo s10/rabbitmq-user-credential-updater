@@ -9,12 +9,15 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/go-logr/logr"
+	"github.com/go-logr/zapr"
 	rabbithole "github.com/michaelklishin/rabbit-hole/v3"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	. "github.com/rabbitmq/default-user-credential-updater/updater"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"gopkg.in/ini.v1"
-	"k8s.io/klog/v2/klogr"
 )
 
 const (
@@ -47,7 +50,7 @@ var _ = Describe("EventHandler", func() {
 	BeforeEach(func() {
 		initConfigFiles()
 
-		log := klogr.New()
+		log := initLogging()
 		fakeAuthClient = &fakeRabbitClient{
 			getUserReturn: map[string]getUserReturn{
 				"admin": {
@@ -336,6 +339,17 @@ var _ = Describe("EventHandler", func() {
 	})
 })
 
+func initLogging() logr.Logger {
+	cfg := zap.NewProductionConfig()
+	cfg.EncoderConfig.EncodeTime = zapcore.TimeEncoderOfLayout(time.RFC3339)
+	cfg.DisableStacktrace = true
+	zapLogger, err := cfg.Build()
+	if err != nil {
+		panic("failed to initialize zap logger: " + err.Error())
+	}
+	return zapr.NewLogger(zapLogger)
+}
+
 // initConfigFiles creates a fresh set of secret files for testing.
 func initConfigFiles() {
 	path := testWatchDir
@@ -403,10 +417,7 @@ type getUserReturn struct {
 	userInfo *rabbithole.UserInfo
 	err      error
 }
-type putUserArg struct {
-	username string
-	info     rabbithole.UserSettings
-}
+
 type putUserReturn struct {
 	resp *http.Response
 	err  error

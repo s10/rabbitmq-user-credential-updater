@@ -9,14 +9,15 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-
-	"k8s.io/klog/v2"
-	"k8s.io/klog/v2/klogr"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/go-logr/logr"
+	"github.com/go-logr/zapr"
 	rabbithole "github.com/michaelklishin/rabbit-hole/v3"
 	"github.com/rabbitmq/default-user-credential-updater/updater"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"gopkg.in/ini.v1"
 )
 
@@ -44,10 +45,9 @@ func main() {
 		"ca-file",
 		"/etc/rabbitmq-tls/ca.crt",
 		"This file contains the trusted certificate for RabbitMQ server authentication.")
-	klog.InitFlags(nil)
 	flag.Parse()
 
-	log := klogr.New().WithName("password-updater")
+	log := initLogging().WithName("password-updater")
 
 	rabbitClient, err := newRabbitClient(log, managementURI, caFile)
 	if err != nil {
@@ -93,6 +93,17 @@ func main() {
 	case <-done:
 		log.V(1).Info("terminating")
 	}
+}
+
+func initLogging() logr.Logger {
+	cfg := zap.NewProductionConfig()
+	cfg.EncoderConfig.EncodeTime = zapcore.TimeEncoderOfLayout(time.RFC3339)
+	cfg.DisableStacktrace = true
+	zapLogger, err := cfg.Build()
+	if err != nil {
+		panic("failed to initialize zap logger: " + err.Error())
+	}
+	return zapr.NewLogger(zapLogger)
 }
 
 func newRabbitClient(log logr.Logger, managementURI, caFile string) (updater.RabbitClient, error) {
