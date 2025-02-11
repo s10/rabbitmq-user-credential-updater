@@ -11,7 +11,7 @@ import (
 )
 
 // NewPasswordUpdater creates a new instance of PasswordUpdater with a properly
-// initialized CredentialCache and file system watcher.
+// initialized CredentialState and file system watcher.
 func NewPasswordUpdater(adminFile string, watchDir string, done chan<- bool, log logr.Logger, adminClient RabbitClient, authClient RabbitClient) (*PasswordUpdater, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -24,7 +24,7 @@ func NewPasswordUpdater(adminFile string, watchDir string, done chan<- bool, log
 		return nil, fmt.Errorf("failed to add directory %q to watcher: %w", watchDir, err)
 	}
 
-	credentialState := initCredentialCache(watchDir, log)
+	credentialState := initCredentialState(watchDir, log)
 	credentialSpec := make(map[string]UserCredentials)
 
 	return &PasswordUpdater{
@@ -40,14 +40,14 @@ func NewPasswordUpdater(adminFile string, watchDir string, done chan<- bool, log
 	}, nil
 }
 
-// initCredentialCache scans the watch directory and loads existing credential files
+// initCredential scans the watch directory and loads existing credential files
 // into a map keyed by userID.
-func initCredentialCache(watchDir string, log logr.Logger) map[string]UserCredentials {
-	credentialCache := make(map[string]UserCredentials)
+func initCredentialState(watchDir string, log logr.Logger) map[string]UserCredentials {
+	credentialState := make(map[string]UserCredentials)
 	files, err := filepath.Glob(filepath.Join(watchDir, userFilePrefix+"*"))
 	if err != nil {
 		log.Error(err, "failed to glob watch directory", "watchDir", watchDir)
-		return credentialCache
+		return credentialState
 	}
 
 	for _, f := range files {
@@ -64,7 +64,7 @@ func initCredentialCache(watchDir string, log logr.Logger) map[string]UserCreden
 			continue
 		}
 		val := strings.TrimSpace(string(content))
-		cred := credentialCache[userID]
+		cred := credentialState[userID]
 		switch key {
 		case "username":
 			cred.Username = val
@@ -73,8 +73,8 @@ func initCredentialCache(watchDir string, log logr.Logger) map[string]UserCreden
 		case "tag":
 			cred.Tag = val
 		}
-		credentialCache[userID] = cred
+		credentialState[userID] = cred
 	}
 
-	return credentialCache
+	return credentialState
 }

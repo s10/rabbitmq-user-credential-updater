@@ -128,9 +128,9 @@ var _ = Describe("EventHandler", func() {
 		})
 	})
 
-	When("passwords already match in credentials cache and secrets directory", func() {
+	When("passwords already match in credentials state and secrets directory", func() {
 		BeforeEach(func() {
-			// Pre-populate the cache so that no update should occur.
+			// Pre-populate the state so that no update should occur.
 			u.CredentialState = map[string]UserCredentials{
 				"default": {
 					Username: "default",
