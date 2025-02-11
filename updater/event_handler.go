@@ -257,7 +257,7 @@ func (u *PasswordUpdater) handleHTTPError(err error, httpMethod, pathUsers, newP
 		// All other nodes are expected to run into this branch.
 		u.Log.V(2).Info("HTTP request with old password returned 401 Unauthorized; authenticating with new password...",
 			"method", httpMethod, "path", pathUsers)
-		u.adminClient.SetPassword(newPasswd)
+		u.authClient.SetPassword(newPasswd)
 		return u.authenticate()
 	}
 	u.Log.Error(err, "HTTP request failed", "method", httpMethod, "path", pathUsers)
