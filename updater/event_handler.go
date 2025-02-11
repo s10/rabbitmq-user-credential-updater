@@ -36,7 +36,8 @@ type PasswordUpdater struct {
 	Log             logr.Logger
 	adminClient     RabbitClient
 	authClient      RabbitClient
-	CredentialCache map[string]UserCredentials
+	CredentialState map[string]UserCredentials
+	CredentialSpec  map[string]UserCredentials
 }
 
 type RabbitClient interface {
@@ -92,8 +93,8 @@ func isSecretFile(filePath string) bool {
 // processSecrets reads all files in WatchDir, groups them by user ID (based on file names),
 // and then (using admin credentials) updates every user whose password has changed.
 func (u *PasswordUpdater) processSecrets() error {
-	u.adminClient.SetUsername(u.CredentialCache["admin"].Username)
-	u.adminClient.SetPassword(u.CredentialCache["admin"].Password)
+	u.adminClient.SetUsername(u.CredentialState["admin"].Username)
+	u.adminClient.SetPassword(u.CredentialState["admin"].Password)
 
 	files, err := os.ReadDir(u.WatchDir)
 	if err != nil {
@@ -118,7 +119,7 @@ func (u *PasswordUpdater) processSecrets() error {
 		remainder := name[len(userFilePrefix):]
 		parts := strings.SplitN(remainder, "_", 2)
 		if len(parts) != 2 {
-			u.Log.V(2).Info("ignoring file with unexpected name format", "file", name)
+			u.Log.V(1).Info("ignoring file with unexpected name format", "file", name)
 			continue
 		}
 		userName, key := parts[0], parts[1]
@@ -141,7 +142,7 @@ func (u *PasswordUpdater) processSecrets() error {
 		password, hasPassword := data["password"]
 		tag, hasTag := data["tag"]
 
-		if cached, exists := u.CredentialCache[username]; exists &&
+		if cached, exists := u.CredentialState[username]; exists &&
 			cached.Password == password && cached.Tag == tag {
 			u.Log.V(4).Info("credentials unchanged, skipping update", "user", username)
 			continue
@@ -150,24 +151,28 @@ func (u *PasswordUpdater) processSecrets() error {
 		u.authClient.SetUsername(username)
 		u.authClient.SetPassword(password)
 
-		if !hasUsername || !hasPassword {
-			u.Log.V(2).Info("skipping user with incomplete credentials", "userID", userID)
-			continue
+		if !hasUsername || !hasPassword || strings.TrimSpace(username) == "" || strings.TrimSpace(password) == "" {
+			u.Log.Error(err, "incomplete or empty credentials for user", "user", userID)
+			return fmt.Errorf("incomplete or empty credentials for user %s", userID)
 		}
 		if !hasTag {
 			tag = ""
 		}
 
 		if userID == "admin" {
-			if strings.TrimSpace(username) == "" || strings.TrimSpace(password) == "" {
-				return fmt.Errorf("incomplete or empty admin credentials")
+			// Verify that we can authenticate with the current admin credentials
+			if err := u.authenticate(u.adminClient); err != nil {
+				u.Log.Error(err, "failed to authenticate with current admin credentials", "user", username)
+				return fmt.Errorf("failed to authenticate with current admin credentials: %w", err)
 			}
+
+			// If admin username has changed, verify we can still authenticate
+			// with current credentials before proceeding with the update
 			currentAdminUser := u.adminClient.GetUsername()
 			if currentAdminUser != username {
-				// If admin username has changed, verify we can still authenticate
-				// with current credentials before proceeding with the update
-				u.Log.V(2).Info("admin username changed", "old", currentAdminUser, "new", username)
-				if err := u.authenticate(); err != nil {
+				u.Log.V(1).Info("admin username changed", "old", currentAdminUser, "new", username)
+				if err := u.authenticate(u.adminClient); err != nil {
+					u.Log.Error(err, "failed to authenticate with current admin credentials", "user", username)
 					return fmt.Errorf("failed to authenticate with current admin credentials: %w", err)
 				}
 			}
@@ -181,10 +186,11 @@ func (u *PasswordUpdater) processSecrets() error {
 
 		// Update credentials in RabbitMQ
 		if err := u.updateInRabbitMQ(newCred); err != nil {
-			return fmt.Errorf("failed to update credentials in RabbitMQ for user %s: %w", username, err)
+			u.Log.Error(err, "failed to update credentials in RabbitMQ for user", "user", username)
+			break
 		}
 		// Update credentials cache, so that we can skip the next update if the credentials haven't changed
-		u.CredentialCache[username] = newCred
+		u.CredentialState[username] = newCred
 
 		if userID == "admin" {
 			// Update admin credentials file, eg /var/lib/rabbitmq/.rabbitmqadmin.conf
@@ -197,15 +203,15 @@ func (u *PasswordUpdater) processSecrets() error {
 				if err := u.updateAdminFile(newCred); err != nil {
 					u.Log.Error(err, "failed to update RabbitMQ admin credentials file", "user", username)
 				} else {
-					u.Log.V(2).Info("updated admin credentials file", "file", u.AdminFile)
+					u.Log.V(1).Info("updated admin credentials file", "file", u.AdminFile)
 				}
 			} else {
-				u.Log.V(2).Info("admin credentials file is already up-to-date, no update needed", "file", u.AdminFile)
+				u.Log.V(1).Info("admin credentials file is already up-to-date, no update needed", "file", u.AdminFile)
 			}
-			if err := u.authenticate(); err != nil {
+			if err := u.authenticate(u.adminClient); err != nil {
 				u.Log.Error(err, "extra admin step: failed to re-authenticate after updating admin credentials", "user", username)
 			} else {
-				u.Log.V(2).Info("extra admin step: re-authentication successful for admin", "user", username)
+				u.Log.V(1).Info("extra admin step: re-authentication successful for admin", "user", username)
 			}
 		}
 	}
@@ -220,45 +226,38 @@ func (u *PasswordUpdater) updateInRabbitMQ(cred UserCredentials) error {
 	var err error
 	user, err = u.adminClient.GetUser(cred.Username)
 	if err != nil {
-		return u.handleHTTPError(err, http.MethodGet, pathUsers, cred.Password)
+		return u.handleHTTPError(u.adminClient, err, http.MethodGet, pathUsers, cred.Password)
 	}
-	if user == nil {
-		return fmt.Errorf("no user info returned for user %s", cred.Username)
-	}
-
-	// Check if the new password is already effective.
-	// (For both types of user we call the proper Whoami check.)
-	if err := u.authenticate(); err == nil {
-		u.Log.V(2).Info("GET request succeeded with new password; skipping PUT",
-			"path", "/api/whoami", "skip_path", pathUsers)
-		return nil
+	hashingAlgorithm := rabbithole.HashingAlgorithmSHA256
+	if user != nil {
+		hashingAlgorithm = user.HashingAlgorithm
 	}
 
 	newUserSettings := rabbithole.UserSettings{
 		Name:             cred.Username,
 		Tags:             rabbithole.UserTags{cred.Tag},
 		Password:         cred.Password,
-		HashingAlgorithm: user.HashingAlgorithm,
+		HashingAlgorithm: hashingAlgorithm,
 	}
 	resp, err := u.adminClient.PutUser(cred.Username, newUserSettings)
 	if err != nil {
-		return u.handleHTTPError(err, http.MethodPut, pathUsers, cred.Password)
+		return u.handleHTTPError(u.adminClient, err, http.MethodPut, pathUsers, cred.Password)
 	}
-	u.Log.V(3).Info("HTTP response", "method", http.MethodPut, "path", pathUsers, "status", resp.Status)
-	u.Log.V(2).Info("updated password on RabbitMQ server", "user", cred.Username)
+	u.Log.V(2).Info("HTTP response", "method", http.MethodPut, "path", pathUsers, "status", resp.Status)
+	u.Log.V(1).Info("updated password on RabbitMQ server", "user", cred.Username)
 	return nil
 }
 
-func (u *PasswordUpdater) handleHTTPError(err error, httpMethod, pathUsers, newPasswd string) error {
+func (u *PasswordUpdater) handleHTTPError(client RabbitClient, err error, httpMethod, pathUsers, newPasswd string) error {
 	// as returned in
 	// https://github.com/michaelklishin/rabbit-hole/blob/1de83b96b8ba1e29afd003143a9d8a8234d4e913/client.go#L153
 	if err.Error() == "Error: API responded with a 401 Unauthorized" {
 		// Only one node in a multi node RabbitMQ cluster will update the password.
 		// All other nodes are expected to run into this branch.
-		u.Log.V(2).Info("HTTP request with old password returned 401 Unauthorized; authenticating with new password...",
+		u.Log.V(1).Info("HTTP request with old password returned 401 Unauthorized; authenticating with new password...",
 			"method", httpMethod, "path", pathUsers)
-		u.authClient.SetPassword(newPasswd)
-		return u.authenticate()
+		client.SetPassword(newPasswd)
+		return u.authenticate(client)
 	}
 	u.Log.Error(err, "HTTP request failed", "method", httpMethod, "path", pathUsers)
 	return err
@@ -267,16 +266,25 @@ func (u *PasswordUpdater) handleHTTPError(err error, httpMethod, pathUsers, newP
 // authenticate checks whether authentication succeeds.
 // It queries /api/whoami (although it could query any other endpoint requiring basic auth).
 // Returns an error if authentication fails.
-func (u *PasswordUpdater) authenticate() error {
+func (u *PasswordUpdater) authenticate(client RabbitClient) error {
 	const pathWhoAmI = "/api/whoami"
-	_, err := u.authClient.Whoami()
+	_, err := client.Whoami()
 	if err != nil {
-		u.Log.Error(err, fmt.Sprintf("failed to GET %s with new password", pathWhoAmI))
+		u.Log.Error(
+			err,
+			fmt.Sprintf("failed to GET %s with new password", pathWhoAmI),
+			"user",
+			client.GetUsername(),
+		)
 		return err
 	}
-	u.Log.V(2).Info("GET request succeeded, skipping PUT",
-		"path", pathWhoAmI,
-		"skip_path", "/api/users/"+u.authClient.GetUsername())
+	u.Log.V(2).Info(
+		fmt.Sprintf(
+			"GET %s with new password succeeded, therefore skipping PUT %s...",
+			pathWhoAmI,
+			"/api/users/"+client.GetUsername(),
+		),
+	)
 	return nil
 }
 

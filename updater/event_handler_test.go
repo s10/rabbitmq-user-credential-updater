@@ -131,7 +131,7 @@ var _ = Describe("EventHandler", func() {
 	When("passwords already match in credentials cache and secrets directory", func() {
 		BeforeEach(func() {
 			// Pre-populate the cache so that no update should occur.
-			u.CredentialCache = map[string]UserCredentials{
+			u.CredentialState = map[string]UserCredentials{
 				"default": {
 					Username: "default",
 					Password: "pwd1",
@@ -321,6 +321,7 @@ var _ = Describe("EventHandler", func() {
 			BeforeEach(func() {
 				// Simulate failed authentication with both old and new passwords for admin.
 				fakeAdminClient.getUserReturn["admin"] = getUserReturn{err: errUnauthorized}
+				fakeAdminClient.whoamiReturn = whoamiReturn{err: errUnauthorized}
 				fakeAuthClient.whoamiReturn = whoamiReturn{err: errUnauthorized}
 			})
 			It("does not update the admin password in RabbitMQ", func() {
@@ -342,7 +343,7 @@ var _ = Describe("EventHandler", func() {
 func initLogging() logr.Logger {
 	cfg := zap.NewProductionConfig()
 	cfg.EncoderConfig.EncodeTime = zapcore.TimeEncoderOfLayout(time.RFC3339)
-	cfg.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
+	cfg.Level = zap.NewAtomicLevelAt(zapcore.DebugLevel)
 	cfg.DisableStacktrace = true
 	zapLogger, err := cfg.Build()
 	if err != nil {

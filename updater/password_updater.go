@@ -24,7 +24,8 @@ func NewPasswordUpdater(adminFile string, watchDir string, done chan<- bool, log
 		return nil, fmt.Errorf("failed to add directory %q to watcher: %w", watchDir, err)
 	}
 
-	credentialCache := initCredentialCache(watchDir, log)
+	credentialState := initCredentialCache(watchDir, log)
+	credentialSpec := make(map[string]UserCredentials)
 
 	return &PasswordUpdater{
 		AdminFile:       adminFile,
@@ -34,7 +35,8 @@ func NewPasswordUpdater(adminFile string, watchDir string, done chan<- bool, log
 		Log:             log,
 		adminClient:     adminClient,
 		authClient:      authClient,
-		CredentialCache: credentialCache,
+		CredentialState: credentialState,
+		CredentialSpec:  credentialSpec,
 	}, nil
 }
 
