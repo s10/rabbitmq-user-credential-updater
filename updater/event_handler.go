@@ -17,6 +17,7 @@ import (
 const (
 	userFilePrefix   = "user_"
 	adminFileSection = "default"
+	adminUserID      = "admin"
 )
 
 // UserCredentials holds the plain‐text credentials read from a secret file group.
@@ -93,8 +94,8 @@ func isSecretFile(filePath string) bool {
 // processSecrets reads all files in WatchDir, groups them by user ID (based on file names),
 // and then (using admin credentials) updates every user whose password has changed.
 func (u *PasswordUpdater) processSecrets() error {
-	u.adminClient.SetUsername(u.CredentialState["admin"].Username)
-	u.adminClient.SetPassword(u.CredentialState["admin"].Password)
+	u.adminClient.SetUsername(u.CredentialState[adminUserID].Username)
+	u.adminClient.SetPassword(u.CredentialState[adminUserID].Password)
 
 	files, err := os.ReadDir(u.WatchDir)
 	if err != nil {
@@ -159,7 +160,7 @@ func (u *PasswordUpdater) processSecrets() error {
 			tag = ""
 		}
 
-		if userID == "admin" {
+		if userID == adminUserID {
 			// Verify that we can authenticate with the current admin credentials
 			if err := u.authenticate(u.adminClient); err != nil {
 				u.Log.Error(err, "failed to authenticate with current admin credentials", "user", username)
@@ -185,14 +186,14 @@ func (u *PasswordUpdater) processSecrets() error {
 		}
 
 		// Update credentials in RabbitMQ
-		if err := u.updateInRabbitMQ(newCred); err != nil {
+		if err := u.updateInRabbitMQ(newCred, u.CredentialSpec); err != nil {
 			u.Log.Error(err, "failed to update credentials in RabbitMQ for user", "user", username)
 			break
 		}
 		// Update credentials cache, so that we can skip the next update if the credentials haven't changed
 		u.CredentialState[username] = newCred
 
-		if userID == "admin" {
+		if userID == adminUserID {
 			// Update admin credentials file, eg /var/lib/rabbitmq/.rabbitmqadmin.conf
 			// Check whether the current admin file are up-to-date.
 			correct, err := u.checkAdminFile(newCred)
@@ -219,14 +220,14 @@ func (u *PasswordUpdater) processSecrets() error {
 }
 
 // updateInRabbitMQ tries to update a user's password (and tag) on the RabbitMQ server.
-func (u *PasswordUpdater) updateInRabbitMQ(cred UserCredentials) error {
+func (u *PasswordUpdater) updateInRabbitMQ(cred UserCredentials, spec map[string]UserCredentials) error {
 	pathUsers := "/api/users/" + cred.Username
 
 	var user *rabbithole.UserInfo
 	var err error
 	user, err = u.adminClient.GetUser(cred.Username)
 	if err != nil {
-		return u.handleHTTPError(u.adminClient, err, http.MethodGet, pathUsers, cred.Password)
+		return u.handleHTTPError(u.adminClient, err, http.MethodGet, pathUsers, spec[adminUserID].Password)
 	}
 	hashingAlgorithm := rabbithole.HashingAlgorithmSHA256
 	if user != nil {
@@ -241,7 +242,7 @@ func (u *PasswordUpdater) updateInRabbitMQ(cred UserCredentials) error {
 	}
 	resp, err := u.adminClient.PutUser(cred.Username, newUserSettings)
 	if err != nil {
-		return u.handleHTTPError(u.adminClient, err, http.MethodPut, pathUsers, cred.Password)
+		return u.handleHTTPError(u.adminClient, err, http.MethodPut, pathUsers, spec[adminUserID].Password)
 	}
 	u.Log.V(2).Info("HTTP response", "method", http.MethodPut, "path", pathUsers, "status", resp.Status)
 	u.Log.V(1).Info("updated password on RabbitMQ server", "user", cred.Username)
