@@ -28,7 +28,8 @@ type UserCredentials struct {
 }
 
 // PasswordUpdater now uses a WatchDir instead of single default configuration file.
-// CredentialCache stores the last successfully verified user credentials.
+// CredentialState stores the last successfully verified user credentials.
+// CredentialSpec stores the expected user credentials.
 type PasswordUpdater struct {
 	AdminFile       string
 	Watcher         *fsnotify.Watcher
@@ -94,6 +95,7 @@ func isSecretFile(filePath string) bool {
 // processSecrets reads all files in WatchDir, groups them by user ID (based on file names),
 // and then (using admin credentials) updates every user whose password has changed.
 func (u *PasswordUpdater) processSecrets() error {
+	// Explicitly set admin credentials from state before processing secrets
 	u.adminClient.SetUsername(u.CredentialState[adminUserID].Username)
 	u.adminClient.SetPassword(u.CredentialState[adminUserID].Password)
 
@@ -143,14 +145,11 @@ func (u *PasswordUpdater) processSecrets() error {
 		password, hasPassword := data["password"]
 		tag, hasTag := data["tag"]
 
-		if cached, exists := u.CredentialState[username]; exists &&
-			cached.Password == password && cached.Tag == tag {
+		if state, exists := u.CredentialState[username]; exists &&
+			state.Password == password && state.Tag == tag {
 			u.Log.V(4).Info("credentials unchanged, skipping update", "user", username)
 			continue
 		}
-
-		u.authClient.SetUsername(username)
-		u.authClient.SetPassword(password)
 
 		if !hasUsername || !hasPassword || strings.TrimSpace(username) == "" || strings.TrimSpace(password) == "" {
 			u.Log.Error(err, "incomplete or empty credentials for user", "user", userID)
@@ -190,8 +189,11 @@ func (u *PasswordUpdater) processSecrets() error {
 			u.Log.Error(err, "failed to update credentials in RabbitMQ for user", "user", username)
 			break
 		}
-		// Update credentials cache, so that we can skip the next update if the credentials haven't changed
+		// Update credentials state, so that we can skip the next update if the credentials haven't changed
 		u.CredentialState[username] = newCred
+		// Update admin RabbitMQ client credentials
+		u.adminClient.SetUsername(u.CredentialState[adminUserID].Username)
+		u.adminClient.SetPassword(u.CredentialState[adminUserID].Password)
 
 		if userID == adminUserID {
 			// Update admin credentials file, eg /var/lib/rabbitmq/.rabbitmqadmin.conf
@@ -209,6 +211,7 @@ func (u *PasswordUpdater) processSecrets() error {
 			} else {
 				u.Log.V(1).Info("admin credentials file is already up-to-date, no update needed", "file", u.AdminFile)
 			}
+			// Verification: re-authenticate after updating admin credentials
 			if err := u.authenticate(u.adminClient); err != nil {
 				u.Log.Error(err, "extra admin step: failed to re-authenticate after updating admin credentials", "user", username)
 			} else {
