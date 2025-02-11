@@ -11,7 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
 	rabbithole "github.com/michaelklishin/rabbit-hole/v3"
@@ -55,13 +54,6 @@ func main() {
 		return
 	}
 
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Error(err, "failed to create watcher")
-		return
-	}
-	defer watcher.Close()
-
 	// Remove trailing new line (.rabbitmqadmin.conf has only one section).
 	ini.PrettySection = false
 
@@ -80,12 +72,6 @@ func main() {
 	}
 
 	go passwordUpdater.HandleEvents()
-
-	log.V(1).Info("start watching", "directory", watchDir)
-	if err := watcher.Add(watchDir); err != nil {
-		log.Error(err, "cannot watch", "directory", watchDir)
-		return
-	}
 
 	select {
 	case sig := <-sigs:
