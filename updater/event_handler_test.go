@@ -342,6 +342,7 @@ var _ = Describe("EventHandler", func() {
 func initLogging() logr.Logger {
 	cfg := zap.NewProductionConfig()
 	cfg.EncoderConfig.EncodeTime = zapcore.TimeEncoderOfLayout(time.RFC3339)
+	cfg.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
 	cfg.DisableStacktrace = true
 	zapLogger, err := cfg.Build()
 	if err != nil {
