@@ -48,9 +48,14 @@ func main() {
 
 	log := initLogging().WithName("password-updater")
 
-	rabbitClient, err := newRabbitClient(log, managementURI, caFile)
+	rabbitAuthClient, err := newRabbitClient(log, managementURI, caFile)
 	if err != nil {
-		log.Error(err, "failed to create RabbitMQ client")
+		log.Error(err, "failed to create RabbitMQ auth client")
+		return
+	}
+	rabbitAdminClient, err := newRabbitClient(log, managementURI, caFile)
+	if err != nil {
+		log.Error(err, "failed to create RabbitMQ admin client")
 		return
 	}
 
@@ -65,7 +70,7 @@ func main() {
 	// This is preferred over calling os.Exit() because os.Exit() does not run deferred functions.
 	done := make(chan bool, 1)
 
-	passwordUpdater, err := updater.NewPasswordUpdater(adminFile, watchDir, done, log, rabbitClient, rabbitClient)
+	passwordUpdater, err := updater.NewPasswordUpdater(adminFile, watchDir, done, log, rabbitAuthClient, rabbitAdminClient)
 	if err != nil {
 		log.Error(err, "Failed to initialize PasswordUpdater")
 		return
