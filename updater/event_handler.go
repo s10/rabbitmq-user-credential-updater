@@ -192,12 +192,12 @@ func (u *PasswordUpdater) updateInRabbitMQ(cred UserCredentials, spec map[string
 	var err error
 
 	user, err = u.adminClient.GetUser(cred.Username)
-	errE := u.handleHTTPError(u.adminClient, err, http.MethodGet, pathUsers, spec[adminUserID].Password)
-	if errE != nil {
-		if errE.Error() == errNotFound {
+	errHTTP := u.handleHTTPError(u.adminClient, err, http.MethodGet, pathUsers, spec[adminUserID].Password)
+	if errHTTP != nil {
+		if errHTTP.Error() == errNotFound {
 			isNewUser = true
 		} else {
-			return errE
+			return errHTTP
 		}
 	}
 
