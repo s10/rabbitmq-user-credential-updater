@@ -139,6 +139,9 @@ func (w rabbitHoleClientWrapper) PutUser(username string, info rabbithole.UserSe
 func (w rabbitHoleClientWrapper) Whoami() (*rabbithole.WhoamiInfo, error) {
 	return w.rabbitHoleClient.Whoami()
 }
+func (w rabbitHoleClientWrapper) UpdatePermissionsIn(vhost string, username string, permissions rabbithole.Permissions) (*http.Response, error) {
+	return w.rabbitHoleClient.UpdatePermissionsIn(vhost, username, permissions)
+}
 func (w rabbitHoleClientWrapper) GetUsername() string {
 	return w.rabbitHoleClient.Username
 }

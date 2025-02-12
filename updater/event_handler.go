@@ -18,6 +18,12 @@ const (
 	adminUserID      = "admin"
 )
 
+var (
+	errUnauthorized        = "Error: API responded with a 401 Unauthorized"
+	errNotFound            = "Error 404 (Object Not Found): Not Found"
+	defaultUserPermissions = rabbithole.Permissions{Configure: ".*", Write: ".*", Read: ".*"}
+)
+
 // UserCredentials holds the plain‐text credentials read from a secret file group.
 type UserCredentials struct {
 	Username string
@@ -44,6 +50,7 @@ type RabbitClient interface {
 	// RabbitMQ Management API functions
 	GetUser(username string) (*rabbithole.UserInfo, error)
 	PutUser(username string, settings rabbithole.UserSettings) (*http.Response, error)
+	UpdatePermissionsIn(vhost string, username string, permissions rabbithole.Permissions) (*http.Response, error)
 	Whoami() (*rabbithole.WhoamiInfo, error)
 
 	// Credential management functions
@@ -179,13 +186,21 @@ func (u *PasswordUpdater) processSecrets() error {
 // updateInRabbitMQ tries to update a user's password (and tag) on the RabbitMQ server.
 func (u *PasswordUpdater) updateInRabbitMQ(cred UserCredentials, spec map[string]UserCredentials) error {
 	pathUsers := "/api/users/" + cred.Username
+	isNewUser := false
 
 	var user *rabbithole.UserInfo
 	var err error
+
 	user, err = u.adminClient.GetUser(cred.Username)
-	if err != nil && u.handleHTTPError(u.adminClient, err, http.MethodGet, pathUsers, spec[adminUserID].Password) != nil {
-		return err
+	errE := u.handleHTTPError(u.adminClient, err, http.MethodGet, pathUsers, spec[adminUserID].Password)
+	if errE != nil {
+		if errE.Error() == errNotFound {
+			isNewUser = true
+		} else {
+			return errE
+		}
 	}
+
 	hashingAlgorithm := rabbithole.HashingAlgorithmSHA256
 	if user != nil {
 		hashingAlgorithm = user.HashingAlgorithm
@@ -203,13 +218,22 @@ func (u *PasswordUpdater) updateInRabbitMQ(cred UserCredentials, spec map[string
 	}
 	u.Log.V(2).Info("HTTP response", "method", http.MethodPut, "path", pathUsers, "status", resp.Status)
 	u.Log.V(1).Info("updated password on RabbitMQ server", "user", cred.Username)
+	if isNewUser {
+		if _, err = u.adminClient.UpdatePermissionsIn("/", cred.Username, defaultUserPermissions); err != nil {
+			return fmt.Errorf("failed to update permissions on RabbitMQ server: %w", err)
+		}
+		u.Log.V(1).Info("set default permissions on RabbitMQ server", "user", cred.Username)
+	}
 	return nil
 }
 
 func (u *PasswordUpdater) handleHTTPError(client RabbitClient, err error, httpMethod, pathUsers, newPasswd string) error {
+	if err == nil {
+		return nil
+	}
 	// as returned in
 	// https://github.com/michaelklishin/rabbit-hole/blob/1de83b96b8ba1e29afd003143a9d8a8234d4e913/client.go#L153
-	if err.Error() == "Error: API responded with a 401 Unauthorized" {
+	if err.Error() == errUnauthorized {
 		// Only one node in a multi node RabbitMQ cluster will update the password.
 		// All other nodes are expected to run into this branch.
 		u.Log.V(1).Info("HTTP request with old password returned 401 Unauthorized; authenticating with new password...",
@@ -217,12 +241,12 @@ func (u *PasswordUpdater) handleHTTPError(client RabbitClient, err error, httpMe
 		client.SetPassword(newPasswd)
 		return u.authenticate(client)
 	}
-	if err.Error() == "Error 404 (Object Not Found): Not Found" && httpMethod == http.MethodGet {
+	if err.Error() == errNotFound && httpMethod == http.MethodGet {
 		// If the user does not exist, GET will return a 404 error.
 		// In this case, we can safely continue creating the user.
 		u.Log.V(1).Info("HTTP request for non-existent user returned 404 Not Found; continuing with PUT...",
 			"method", httpMethod, "path", pathUsers)
-		return nil
+		return err
 	}
 	u.Log.Error(err, "HTTP request failed", "method", httpMethod, "path", pathUsers)
 	return err

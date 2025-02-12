@@ -394,14 +394,16 @@ type fakeRabbitClient struct {
 	Password string
 
 	// Track all calls with details
-	GetUserCalls []GetUserCall
-	PutUserCalls []PutUserCall
-	WhoamiCalls  []WhoamiCall
+	GetUserCalls             []GetUserCall
+	PutUserCalls             []PutUserCall
+	WhoamiCalls              []WhoamiCall
+	UpdatePermissionsInCalls []UpdatePermissionsInCall
 
 	// Return values
-	getUserReturn map[string]getUserReturn
-	putUserReturn putUserReturn
-	whoamiReturn  whoamiReturn
+	getUserReturn             map[string]getUserReturn
+	putUserReturn             putUserReturn
+	whoamiReturn              whoamiReturn
+	updatePermissionsInReturn updatePermissionsInReturn
 }
 
 type GetUserCall struct {
@@ -411,6 +413,12 @@ type GetUserCall struct {
 type PutUserCall struct {
 	Username string
 	Settings rabbithole.UserSettings
+}
+
+type UpdatePermissionsInCall struct {
+	Vhost       string
+	Username    string
+	Permissions rabbithole.Permissions
 }
 
 type WhoamiCall struct{}
@@ -429,6 +437,11 @@ type whoamiReturn struct {
 	err  error
 }
 
+type updatePermissionsInReturn struct {
+	resp *http.Response
+	err  error
+}
+
 func (frc *fakeRabbitClient) GetUser(username string) (*rabbithole.UserInfo, error) {
 	frc.GetUserCalls = append(frc.GetUserCalls, GetUserCall{Username: username})
 
@@ -444,6 +457,15 @@ func (frc *fakeRabbitClient) PutUser(username string, info rabbithole.UserSettin
 		Settings: info,
 	})
 	return frc.putUserReturn.resp, frc.putUserReturn.err
+}
+
+func (frc *fakeRabbitClient) UpdatePermissionsIn(vhost string, username string, permissions rabbithole.Permissions) (*http.Response, error) {
+	frc.UpdatePermissionsInCalls = append(frc.UpdatePermissionsInCalls, UpdatePermissionsInCall{
+		Vhost:       vhost,
+		Username:    username,
+		Permissions: permissions,
+	})
+	return frc.updatePermissionsInReturn.resp, frc.updatePermissionsInReturn.err
 }
 
 // Add back the missing interface methods
@@ -481,6 +503,7 @@ func (frc *fakeRabbitClient) Reset() {
 	frc.GetUserCalls = nil
 	frc.PutUserCalls = nil
 	frc.WhoamiCalls = nil
+	frc.UpdatePermissionsInCalls = nil
 	frc.Username = ""
 	frc.Password = ""
 }
