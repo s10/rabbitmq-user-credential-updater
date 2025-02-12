@@ -263,6 +263,12 @@ func (u *PasswordUpdater) handleHTTPError(client RabbitClient, err error, httpMe
 		client.SetPassword(newPasswd)
 		return u.authenticate(client)
 	}
+	if err.Error() == "Error 404 (Object Not Found): Not Found" && httpMethod == http.MethodGet {
+		// If the user does not exist, GET will return a 404 error.
+		// In this case, we can safely continue creating the user.
+		u.Log.V(1).Info("HTTP request failed", "method", httpMethod, "path", pathUsers)
+		return nil
+	}
 	u.Log.Error(err, "HTTP request failed", "method", httpMethod, "path", pathUsers)
 	return err
 }
