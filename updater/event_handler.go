@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/fsnotify/fsnotify"
@@ -117,7 +116,7 @@ func (u *PasswordUpdater) processSecrets() error {
 		secretFiles[file.Name()] = content
 	}
 
-	secrets := make(map[string]map[string]string)
+	secrets := make(map[string]*UserCredentials)
 	for name, contentBytes := range secretFiles {
 		remainder := name[len(userFilePrefix):]
 		parts := strings.SplitN(remainder, "_", 2)
@@ -125,25 +124,29 @@ func (u *PasswordUpdater) processSecrets() error {
 			u.Log.V(1).Info("ignoring file with unexpected name format", "file", name)
 			continue
 		}
-		userName, key := parts[0], parts[1]
+		userID, key := parts[0], parts[1]
 		value := strings.TrimSpace(string(contentBytes))
-		if _, exists := secrets[userName]; !exists {
-			secrets[userName] = make(map[string]string)
+
+		if _, exists := secrets[userID]; !exists {
+			secrets[userID] = &UserCredentials{}
 		}
-		secrets[userName][key] = value
+
+		switch key {
+		case "username":
+			secrets[userID].Username = value
+		case "password":
+			secrets[userID].Password = value
+		case "tag":
+			secrets[userID].Tag = value
+		default:
+			u.Log.V(1).Info("ignoring unknown credential key", "file", name, "key", key)
+		}
 	}
 
-	var userNames []string
-	for userID := range secrets {
-		userNames = append(userNames, userID)
-	}
-	sort.Strings(userNames)
-
-	for _, userID := range userNames {
-		data := secrets[userID]
-		username, hasUsername := data["username"]
-		password, hasPassword := data["password"]
-		tag, hasTag := data["tag"]
+	for userID, creds := range secrets {
+		username, hasUsername := creds.Username, creds.Username != ""
+		password, hasPassword := creds.Password, creds.Password != ""
+		tag, hasTag := creds.Tag, creds.Tag != ""
 
 		if state, exists := u.CredentialState[username]; exists &&
 			state.Password == password && state.Tag == tag {
