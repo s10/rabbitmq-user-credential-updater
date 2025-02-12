@@ -13,7 +13,6 @@ require (
 	github.com/onsi/gomega v1.36.2
 	go.uber.org/zap v1.27.0
 	gopkg.in/ini.v1 v1.67.0
-	k8s.io/klog/v2 v2.130.1
 )
 
 require (
