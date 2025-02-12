@@ -229,8 +229,8 @@ func (u *PasswordUpdater) updateInRabbitMQ(cred UserCredentials, spec map[string
 	var user *rabbithole.UserInfo
 	var err error
 	user, err = u.adminClient.GetUser(cred.Username)
-	if err != nil {
-		return u.handleHTTPError(u.adminClient, err, http.MethodGet, pathUsers, spec[adminUserID].Password)
+	if err != nil && u.handleHTTPError(u.adminClient, err, http.MethodGet, pathUsers, spec[adminUserID].Password) != nil {
+		return err
 	}
 	hashingAlgorithm := rabbithole.HashingAlgorithmSHA256
 	if user != nil {
@@ -266,7 +266,8 @@ func (u *PasswordUpdater) handleHTTPError(client RabbitClient, err error, httpMe
 	if err.Error() == "Error 404 (Object Not Found): Not Found" && httpMethod == http.MethodGet {
 		// If the user does not exist, GET will return a 404 error.
 		// In this case, we can safely continue creating the user.
-		u.Log.V(1).Info("HTTP request failed", "method", httpMethod, "path", pathUsers)
+		u.Log.V(1).Info("HTTP request for non-existent user returned 404 Not Found; continuing with PUT...",
+			"method", httpMethod, "path", pathUsers)
 		return nil
 	}
 	u.Log.Error(err, "HTTP request failed", "method", httpMethod, "path", pathUsers)
