@@ -24,7 +24,10 @@ func NewPasswordUpdater(adminFile string, watchDir string, done chan<- bool, log
 		return nil, fmt.Errorf("failed to add directory %q to watcher: %w", watchDir, err)
 	}
 
-	credentialState := initCredentialState(watchDir, log)
+	credentialState, err := loadSecrets(watchDir, log)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load credential state: %w", err)
+	}
 	credentialSpec := make(map[string]UserCredentials)
 
 	return &PasswordUpdater{
@@ -40,41 +43,72 @@ func NewPasswordUpdater(adminFile string, watchDir string, done chan<- bool, log
 	}, nil
 }
 
-// initCredential scans the watch directory and loads existing credential files
+// loadSecrets scans the watch directory and loads existing credential files
 // into a map keyed by userID.
-func initCredentialState(watchDir string, log logr.Logger) map[string]UserCredentials {
+func loadSecrets(watchDir string, log logr.Logger) (map[string]UserCredentials, error) {
 	credentialState := make(map[string]UserCredentials)
-	files, err := filepath.Glob(filepath.Join(watchDir, userFilePrefix+"*"))
+	files, err := os.ReadDir(watchDir)
 	if err != nil {
-		log.Error(err, "failed to glob watch directory", "watchDir", watchDir)
-		return credentialState
+		log.Error(err, "failed to read watch directory", "watchDir", watchDir)
+		return nil, fmt.Errorf("failed to read watch directory: %w", err)
 	}
 
-	for _, f := range files {
-		name := filepath.Base(f)
-		parts := strings.SplitN(name[len(userFilePrefix):], "_", 2)
+	for _, file := range files {
+		if file.IsDir() || !strings.HasPrefix(file.Name(), userFilePrefix) {
+			continue
+		}
+
+		name := file.Name()
+		remainder := name[len(userFilePrefix):]
+		parts := strings.SplitN(remainder, "_", 2)
 		if len(parts) != 2 {
-			log.V(2).Info("ignoring file with unexpected name format", "file", name)
+			log.V(1).Info("ignoring file with unexpected name format", "file", name)
 			continue
 		}
+
 		userID, key := parts[0], parts[1]
-		content, err := os.ReadFile(f)
+		content, err := os.ReadFile(filepath.Join(watchDir, name))
 		if err != nil {
-			log.Error(err, "failed to read credential file", "file", name)
+			log.Error(err, "failed to read secret file", "file", name)
 			continue
 		}
-		val := strings.TrimSpace(string(content))
+
+		value := strings.TrimSpace(string(content))
 		cred := credentialState[userID]
 		switch key {
 		case "username":
-			cred.Username = val
+			cred.Username = value
 		case "password":
-			cred.Password = val
+			cred.Password = value
 		case "tag":
-			cred.Tag = val
+			if value != "" {
+				cred.Tag = value
+			} else {
+				cred.Tag = ""
+			}
+		default:
+			log.V(1).Info("ignoring unknown credential key", "file", name, "key", key)
+			continue
 		}
 		credentialState[userID] = cred
+
+		if cred.Username != "" && cred.Password != "" {
+			log.V(2).Info("loaded credential", "userID", userID, "username", cred.Username)
+		}
 	}
 
-	return credentialState
+	for userID, cred := range credentialState {
+		if cred.Username == "" || cred.Password == "" {
+			if userID == adminUserID {
+				return nil, fmt.Errorf("incomplete credentials during load, missing username or password for admin user")
+			} else {
+				log.V(1).Info("incomplete credentials during initialization",
+					"userID", userID,
+					"hasUsername", cred.Username != "",
+					"hasPassword", cred.Password != "")
+			}
+		}
+	}
+
+	return credentialState, nil
 }

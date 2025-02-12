@@ -3,7 +3,6 @@ package updater
 import (
 	"fmt"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -98,68 +97,20 @@ func (u *PasswordUpdater) processSecrets() error {
 	u.adminClient.SetUsername(u.CredentialState[adminUserID].Username)
 	u.adminClient.SetPassword(u.CredentialState[adminUserID].Password)
 
-	files, err := os.ReadDir(u.WatchDir)
+	var err error
+	u.CredentialSpec, err = loadSecrets(u.WatchDir, u.Log)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load credential state: %w", err)
 	}
 
-	secretFiles := make(map[string][]byte)
-	for _, file := range files {
-		if file.IsDir() || !strings.HasPrefix(file.Name(), userFilePrefix) {
-			continue
-		}
-		content, err := os.ReadFile(filepath.Join(u.WatchDir, file.Name()))
-		if err != nil {
-			u.Log.Error(err, "failed to read secret file", "file", file.Name())
-			return err
-		}
-		secretFiles[file.Name()] = content
-	}
-
-	secrets := make(map[string]*UserCredentials)
-	for name, contentBytes := range secretFiles {
-		remainder := name[len(userFilePrefix):]
-		parts := strings.SplitN(remainder, "_", 2)
-		if len(parts) != 2 {
-			u.Log.V(1).Info("ignoring file with unexpected name format", "file", name)
-			continue
-		}
-		userID, key := parts[0], parts[1]
-		value := strings.TrimSpace(string(contentBytes))
-
-		if _, exists := secrets[userID]; !exists {
-			secrets[userID] = &UserCredentials{}
-		}
-
-		switch key {
-		case "username":
-			secrets[userID].Username = value
-		case "password":
-			secrets[userID].Password = value
-		case "tag":
-			secrets[userID].Tag = value
-		default:
-			u.Log.V(1).Info("ignoring unknown credential key", "file", name, "key", key)
-		}
-	}
-
-	for userID, creds := range secrets {
-		username, hasUsername := creds.Username, creds.Username != ""
-		password, hasPassword := creds.Password, creds.Password != ""
-		tag, hasTag := creds.Tag, creds.Tag != ""
-
+	for userID, creds := range u.CredentialSpec {
+		username := creds.Username
+		password := creds.Password
+		tag := creds.Tag
 		if state, exists := u.CredentialState[username]; exists &&
 			state.Password == password && state.Tag == tag {
 			u.Log.V(4).Info("credentials unchanged, skipping update", "user", username)
 			continue
-		}
-
-		if !hasUsername || !hasPassword || strings.TrimSpace(username) == "" || strings.TrimSpace(password) == "" {
-			u.Log.Error(err, "incomplete or empty credentials for user", "user", userID)
-			return fmt.Errorf("incomplete or empty credentials for user %s", userID)
-		}
-		if !hasTag {
-			tag = ""
 		}
 
 		if userID == adminUserID {
