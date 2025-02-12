@@ -107,7 +107,7 @@ func (u *PasswordUpdater) processSecrets() error {
 		username := creds.Username
 		password := creds.Password
 		tag := creds.Tag
-		if state, exists := u.CredentialState[username]; exists &&
+		if state, exists := u.CredentialState[userID]; exists &&
 			state.Password == password && state.Tag == tag {
 			u.Log.V(4).Info("credentials unchanged, skipping update", "user", username)
 			continue
@@ -144,7 +144,7 @@ func (u *PasswordUpdater) processSecrets() error {
 			break
 		}
 		// Update credentials state, so that we can skip the next update if the credentials haven't changed
-		u.CredentialState[username] = newCred
+		u.CredentialState[userID] = newCred
 		// Update admin RabbitMQ client credentials
 		u.adminClient.SetUsername(u.CredentialState[adminUserID].Username)
 		u.adminClient.SetPassword(u.CredentialState[adminUserID].Password)
